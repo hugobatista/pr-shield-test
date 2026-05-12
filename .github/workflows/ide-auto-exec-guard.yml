@@ -22,9 +22,8 @@ on:
   workflow_dispatch:
     inputs:
       base_ref:
-        description: 'Base branch to compare against (defaults to the repository default branch)'
+        description: 'Branch to diff against (only used for manual workflow_dispatch runs; ignored on pull_request triggers)'
         required: false
-        default: 'main'
 
 permissions:
   pull-requests: write
@@ -39,7 +38,7 @@ jobs:
 
     steps:
       - name: Checkout PR
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
