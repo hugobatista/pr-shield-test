@@ -1,0 +1,358 @@
+name: 🛡️ IDE Auto-Execution Guard
+
+on:
+  pull_request:
+    paths:
+      - '.vscode/**'
+      - '.claude/**'
+      - '.idea/**'
+      - '.cursor/**'
+      - '.codeium/**'
+      - '.continue/**'
+      - '.windsurf/**'
+      - '.github/copilot-instructions.md'
+      - '**/.vscode/**'
+      - '**/.claude/**'
+      - '**/.idea/**'
+      - '**/.cursor/**'
+      - '**/.codeium/**'
+      - '**/.continue/**'
+      - '**/.windsurf/**'
+
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'Base branch to compare against (defaults to the repository default branch)'
+        required: false
+        default: ${{ github.event.repository.default_branch }}
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  ide-config-security:
+    name: IDE Auto-Execution Guard
+    runs-on: ubuntu-latest
+    env:
+      BASE_REF: ${{ github.base_ref || github.event.inputs.base_ref || 'main' }}
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate base branch reference
+        run: |
+          if ! echo "$BASE_REF" | grep -qE '^[a-zA-Z0-9_/.-]+$'; then
+            echo "::error::Invalid base branch reference: '$BASE_REF'. Branch names may only contain alphanumeric characters, underscores, hyphens, dots, and forward slashes."
+            exit 1
+          fi
+          echo "✓ BASE_REF validated: $BASE_REF"
+          echo "DIFF_BASE=origin/$BASE_REF...HEAD" >> "$GITHUB_ENV"
+          echo "LOG_RANGE=origin/$BASE_REF..HEAD" >> "$GITHUB_ENV"
+
+      - name: Fetch base branch
+        run: |
+          git fetch origin "$BASE_REF"
+
+      # ---------------------------------------------------------------
+      # 1. Detect IDE / AI-agent config directories being added/modified
+      # ---------------------------------------------------------------
+      - name: Detect IDE config changes
+        id: ide_dirs
+        run: |
+          DIRS=".vscode .claude .idea .cursor .codeium .continue .windsurf"
+          FOUND=""
+          for dir in $DIRS; do
+            # Escape dots so .vscode isn't treated as "any char + vscode" in the regex
+            escaped_dir="${dir//./\\.}"
+            if git diff --name-only -z "$DIFF_BASE" | grep -z -qE "^(.*/)?${escaped_dir}/"; then
+              FOUND="$FOUND $dir"
+            fi
+          done
+          # Also flag copilot instructions file
+          if git diff --name-only -z "$DIFF_BASE" | grep -z -qE "copilot-instructions\.md"; then
+            FOUND="$FOUND .github/copilot-instructions.md"
+          fi
+          echo "found=$FOUND" >> $GITHUB_OUTPUT
+          if [ -n "$FOUND" ]; then
+            echo "⚠️  IDE/Agent config directories changed:$FOUND"
+          else
+            echo "✅ No IDE/agent config directories changed."
+          fi
+
+      # ---------------------------------------------------------------
+      # 2. Scan for runOn: folderOpen (VS Code auto-task execution)
+      # ---------------------------------------------------------------
+      - name: Scan for runOn folderOpen
+        id: run_on
+        run: |
+          MATCHES=""
+          while IFS= read -r -d '' file; do
+            if [ -f "$file" ]; then
+              if grep -Pn '"runOn"\s*:\s*"folderOpen"' "$file" 2>/dev/null; then
+                MATCHES="${MATCHES}"$'\n'"${file}"
+              fi
+            fi
+          done < <(git diff --name-only -z "$DIFF_BASE" | grep -z -E '^(.*/)?(\.vscode|\.claude|\.idea|\.cursor|\.codeium|\.continue|\.windsurf)/.*\.json$')
+
+          if [ -n "$MATCHES" ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            MATCHES_ENCODED=$(printf "%s" "$MATCHES" | base64 -w0)
+            echo "matches_encoded=$MATCHES_ENCODED" >> $GITHUB_OUTPUT
+            printf "🚨 runOn:folderOpen detected in:\n%s\n" "$MATCHES"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "matches_encoded=" >> $GITHUB_OUTPUT
+            echo "✅ No runOn:folderOpen found."
+          fi
+
+      # ---------------------------------------------------------------
+      # 3. Scan for Claude / AI-agent SessionStart hooks
+      # ---------------------------------------------------------------
+      - name: Scan for AI agent SessionStart hooks
+        id: session_start
+        run: |
+          MATCHES=""
+          while IFS= read -r -d '' file; do
+            if [ -f "$file" ]; then
+              if grep -Pn '"SessionStart"|SessionStart' "$file" 2>/dev/null; then
+                MATCHES="${MATCHES}"$'\n'"${file}"
+              fi
+            fi
+          done < <(git diff --name-only -z "$DIFF_BASE" | grep -z -E '^(.*/)?(\.vscode|\.claude|\.idea|\.cursor|\.codeium|\.continue|\.windsurf)/.*\.json$')
+
+          if [ -n "$MATCHES" ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            MATCHES_ENCODED=$(printf "%s" "$MATCHES" | base64 -w0)
+            echo "matches_encoded=$MATCHES_ENCODED" >> $GITHUB_OUTPUT
+            printf "🚨 SessionStart hook detected in:\n%s\n" "$MATCHES"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "matches_encoded=" >> $GITHUB_OUTPUT
+            echo "✅ No SessionStart hooks found."
+          fi
+
+      # ---------------------------------------------------------------
+      # 4. Scan for external download / exec patterns (curl, wget, etc.)
+      # ---------------------------------------------------------------
+      - name: Scan for external download/exec patterns
+        id: exec_patterns
+        run: |
+          MATCHES=""
+          PATTERNS=(
+            # -- External download commands (require space after to avoid partial matches)
+            'curl\s+'
+            'wget\s+'
+            # -- fetch as a command/API call, not as a word (avoids false positives like "fetch-depth")
+            '\bfetch[\s\(]'
+            # -- External URLs in config files (known false positive: extension marketplace URLs)
+            'https?://'
+            # -- Command execution patterns
+            '\bexec\b'
+            '\bspawn\b'
+            '\beval\b'
+            # -- File permission changes
+            '\bchmod\b'
+            # -- Obfuscation: base64 decode, hex encoding, command substitution
+            'base64\s*(-d|--decode)'
+            '\$\(.*\)'
+            # -- Cross-platform shell execution
+            'powershell'
+            'cmd\.exe'
+            # -- Inline code execution
+            'python\s+-c'
+            'node\s+-e'
+            'bun\s+run'
+            '\\\\x[0-9a-fA-F]{2}'
+          )
+
+          # Use NUL-delimited git diff to handle filenames with spaces safely
+          while IFS= read -r -d '' file; do
+            case "$file" in
+              .vscode/*|*/.vscode/*|.claude/*|*/.claude/*|.idea/*|*/.idea/*|.cursor/*|*/.cursor/*|.codeium/*|*/.codeium/*|.continue/*|*/.continue/*|.windsurf/*|*/.windsurf/*)
+                if [ -f "$file" ]; then
+                  for pattern in "${PATTERNS[@]}"; do
+                    result=$(grep -Pn "$pattern" "$file" 2>/dev/null | head -5)
+                    if [ -n "$result" ]; then
+                      MATCHES="${MATCHES}"$'\n\n'"${file}] matches '${pattern}':"$'\n'"${result}"
+                    fi
+                  done
+                fi
+                ;;
+            esac
+          done < <(git diff --name-only -z "$DIFF_BASE")
+
+          if [ -n "$MATCHES" ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            MATCHES_ENCODED=$(printf "%s" "$MATCHES" | base64 -w0)
+            echo "matches_encoded=$MATCHES_ENCODED" >> $GITHUB_OUTPUT
+            printf "🚨 Suspicious exec/download patterns found:\n%s\n" "$MATCHES"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "matches_encoded=" >> $GITHUB_OUTPUT
+            echo "✅ No suspicious exec/download patterns found."
+          fi
+
+      # ---------------------------------------------------------------
+      # 5. Verify commit author identity on IDE config file commits
+      # ---------------------------------------------------------------
+      - name: Check commit author identity
+        id: author_check
+        run: |
+          SUSPICIOUS=""
+          KNOWN_BOT_PATTERNS=("dependabot" "renovate" "github-actions" "pre-commit-ci")
+
+          # Get commits that touch IDE config dirs in this PR
+          COMMITS=$(git log $LOG_RANGE --format="%H %ae %an" -- \
+            '.vscode/' '.claude/' '.idea/' '.cursor/' '.codeium/' '.continue/' '.windsurf/' '.github/copilot-instructions.md' 2>/dev/null)
+
+          while IFS=' ' read -r hash email name; do
+            [ -z "$hash" ] && continue
+            TRUSTED=false
+            for bot in "${KNOWN_BOT_PATTERNS[@]}"; do
+              if echo "$email $name" | grep -qi "$bot"; then
+                TRUSTED=true
+                break
+              fi
+            done
+            # Flag emails that look spoofed (noreply-style, empty, or generic)
+            if ! $TRUSTED; then
+              if echo "$email" | grep -qiE '^$|noreply|no-reply|git@|unknown'; then
+                SUSPICIOUS="$SUSPICIOUS\n  ⚠️  Commit $hash by '$name' <$email> — verify identity"
+              fi
+            fi
+          done <<< "$COMMITS"
+
+          if [ -n "$SUSPICIOUS" ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            printf "⚠️  Suspicious commit authors on IDE config changes:$SUSPICIOUS\n"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "✅ Commit authors look normal."
+          fi
+
+      # ---------------------------------------------------------------
+      # 6. Post a consolidated PR comment
+      # ---------------------------------------------------------------
+      - name: Post PR security comment
+        # Skip on workflow_dispatch (no PR context) and forked PRs (read-only token)
+        if: |
+          always() &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.fork != true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Helper to decode base64 step outputs
+            function decodeOutput(encoded) {
+              if (!encoded || encoded === '') return '';
+              try { return Buffer.from(encoded, 'base64').toString('utf-8'); } catch { return '(unable to decode)'; }
+            }
+
+            const ideDirs      = '${{ steps.ide_dirs.outputs.found }}';
+            const runOn        = '${{ steps.run_on.outputs.found }}';
+            const sessionStart = '${{ steps.session_start.outputs.found }}';
+            const execPat      = '${{ steps.exec_patterns.outputs.found }}';
+            const authorCheck  = '${{ steps.author_check.outputs.found }}';
+
+            const runOnMatches       = decodeOutput('${{ steps.run_on.outputs.matches_encoded }}');
+            const sessionStartMatches = decodeOutput('${{ steps.session_start.outputs.matches_encoded }}');
+            const execPatMatches     = decodeOutput('${{ steps.exec_patterns.outputs.matches_encoded }}');
+
+            const critical = runOn === 'true' || sessionStart === 'true' || execPat === 'true';
+            const warning  = ideDirs.trim() !== '' || authorCheck === 'true';
+
+            if (!critical && !warning) {
+              console.log('No IDE auto-exec security issues found. Skipping comment.');
+              return;
+            }
+
+            let body = `## 🛡️ IDE auto-exec security Check\n\n`;
+
+            if (critical) {
+              body += `> ⛔ **CRITICAL findings** — this PR must be reviewed by a maintainer before merging.\n\n`;
+            } else {
+              body += `> ⚠️ **Advisory** — IDE/agent config files were modified. Please review the items below.\n\n`;
+            }
+
+            if (runOn === 'true') {
+              body += `### 🚨 \`runOn: "folderOpen"\` detected\n`;
+              body += `A \`.vscode/tasks.json\` in this PR contains \`runOn: "folderOpen"\`, which causes VS Code to **automatically execute code** when any developer opens this workspace.\n`;
+              body += `This is the primary persistence mechanism used by the [Mini Shai-Hulud supply chain worm](https://www.aikido.dev/blog/mini-shai-hulud-is-back-tanstack-compromised).\n\n`;
+              body += `**Required action:** Remove or justify the \`runOn: "folderOpen"\` entry before merge.\n\n`;
+              body += `\`\`\`\n${runOnMatches}\n\`\`\`\n\n`;
+            }
+
+            if (sessionStart === 'true') {
+              body += `### 🚨 AI agent \`SessionStart\` hook detected\n`;
+              body += `A config file (likely \`.claude/settings.json\`) contains a \`SessionStart\` hook. Claude Code and other AI agents execute these automatically at session startup.\n`;
+              body += `This was used in recent supply chain attacks to re-execute malware whenever an AI coding session begins.\n\n`;
+              body += `**Required action:** Verify this hook is intentional and safe before merge.\n\n`;
+              body += `\`\`\`\n${sessionStartMatches}\n\`\`\`\n\n`;
+            }
+
+            if (execPat === 'true') {
+              body += `### 🚨 External download / exec patterns in IDE config files\n`;
+              body += `One or more changed IDE/agent config files contain patterns like \`curl\`, \`wget\`, \`eval\`, \`exec\`, external URLs, or obfuscated code.\n`;
+              body += `These patterns in IDE config files are high-risk and may execute automatically when the workspace is opened.\n\n`;
+              body += `**Required action:** Review all flagged files carefully. Legitimate IDE configs almost never fetch external URLs.\n\n`;
+              body += `\`\`\`\n${execPatMatches}\n\`\`\`\n\n`;
+            }
+
+            if (ideDirs.trim() !== '') {
+              body += `### ⚠️ IDE / AI-agent config directories modified\n`;
+              body += `Changed directories: \`${ideDirs.trim()}\`\n\n`;
+              body += `These directories control how IDEs and AI agents behave in this workspace. Changes should be intentional and reviewed by at least one maintainer.\n\n`;
+            }
+
+            if (authorCheck === 'true') {
+              body += `### ⚠️ Suspicious commit author on IDE config changes\n`;
+              body += `A commit touching IDE config files has an unrecognised or suspicious author email. This was used in Mini Shai-Hulud attacks to disguise malicious commits as routine dependency updates.\n\n`;
+              body += `**Required action:** Verify the author's identity and the content of the commit.\n\n`;
+            }
+
+            body += `---\n`;
+            body += `<details><summary>ℹ️ Why these checks exist</summary>\n\n`;
+            body += `The [Mini Shai-Hulud npm worm](https://www.aikido.dev/blog/mini-shai-hulud-is-back-tanstack-compromised) (active April–May 2026) compromises developer machines by committing malicious IDE config files to repos under a spoofed identity. When a developer opens the repo, VS Code auto-runs the payload via \`runOn: "folderOpen"\` tasks, or AI agents re-execute it via \`SessionStart\` hooks.\n\n`;
+            body += `This check was added as a defensive measure. See the [Endor Labs writeup](https://www.endorlabs.com/learn/mini-shai-hulud-npm-worm-hits-sap-developer-packages) for details.\n`;
+            body += `</details>\n`;
+
+            // Find and update existing comment, or create new one
+            const marker = '## 🛡️ IDE auto-exec security Check';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body,
+              });
+            }
+
+      # ---------------------------------------------------------------
+      # 7. Fail the check if critical findings exist
+      # ---------------------------------------------------------------
+      - name: Fail on critical findings
+        if: |
+          steps.run_on.outputs.found == 'true' ||
+          steps.session_start.outputs.found == 'true' ||
+          steps.exec_patterns.outputs.found == 'true'
+        run: |
+          echo "::error::🚨 Critical IDE auto-exec security findings detected. Review the PR comment for details."
+          exit 1
