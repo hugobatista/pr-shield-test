@@ -3,21 +3,44 @@ name: 🛡️ IDE Auto-Execution Guard
 on:
   pull_request:
     paths:
+      # Root-level guarded directories (with and without trailing /** to catch symlink replacements)
+      - '.vscode'
       - '.vscode/**'
+      - '.claude'
       - '.claude/**'
+      - '.idea'
       - '.idea/**'
+      - '.cursor'
       - '.cursor/**'
+      - '.codeium'
       - '.codeium/**'
+      - '.continue'
       - '.continue/**'
+      - '.windsurf'
       - '.windsurf/**'
-      - '.github/copilot-instructions.md'
+      - '.github'
+      - '.github/**'
+      - '.devcontainer'
+      - '.devcontainer/**'
+      # Subdirectory guarded directories
+      - '**/.vscode'
       - '**/.vscode/**'
+      - '**/.github'
+      - '**/.github/**'
+      - '**/.claude'
       - '**/.claude/**'
+      - '**/.idea'
       - '**/.idea/**'
+      - '**/.cursor'
       - '**/.cursor/**'
+      - '**/.codeium'
       - '**/.codeium/**'
+      - '**/.continue'
       - '**/.continue/**'
+      - '**/.windsurf'
       - '**/.windsurf/**'
+      - '**/.devcontainer'
+      - '**/.devcontainer/**'
 
   workflow_dispatch:
     inputs:
@@ -35,6 +58,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BASE_REF: ${{ github.base_ref || github.event.inputs.base_ref || 'main' }}
+      # Shared directory patterns used across multiple scan steps (keeps them in sync)
+      CASE_GLOB: '.vscode|*/.vscode|.vscode/*|*/.vscode/*|.claude|*/.claude|.claude/*|*/.claude/*|.idea|*/.idea|.idea/*|*/.idea/*|.cursor|*/.cursor|.cursor/*|*/.cursor/*|.codeium|*/.codeium|.codeium/*|*/.codeium/*|.continue|*/.continue|.continue/*|*/.continue/*|.windsurf|*/.windsurf|.windsurf/*|*/.windsurf/*|.github|*/.github|.github/*|*/.github/*|.devcontainer|*/.devcontainer|.devcontainer/*|*/.devcontainer/*'
+      GREP_DIRS: '\.vscode|\.claude|\.idea|\.cursor|\.codeium|\.continue|\.windsurf|\.devcontainer'
 
     steps:
       - name: Checkout PR
@@ -62,20 +88,27 @@ jobs:
       - name: Detect IDE config changes
         id: ide_dirs
         run: |
-          DIRS=".vscode .claude .idea .cursor .codeium .continue .windsurf"
+          DIRS=".vscode .claude .idea .cursor .codeium .continue .windsurf .devcontainer"
           FOUND=""
           for dir in $DIRS; do
             # Escape dots so .vscode isn't treated as "any char + vscode" in the regex
             escaped_dir="${dir//./\\.}"
-            if git diff --name-only -z "$DIFF_BASE" | grep -z -qE "^(.*/)?${escaped_dir}/"; then
+            # Match both dir/contents and bare dir name (catches symlink-directory-replacement attacks)
+            if git diff --name-only -z "$DIFF_BASE" | grep -z -qE "^(.*/)?${escaped_dir}(/|$)"; then
               FOUND="$FOUND $dir"
+              # Check if the directory entry itself is a symlink (not a real directory)
+              if git diff --name-only -z "$DIFF_BASE" | grep -z -qE "^(.*/)?${escaped_dir}$"; then
+                echo "⚠️  ${dir} is a FILE/SYMLINK, not a directory — possible symlink replacement attack"
+              fi
             fi
           done
-          # Also flag copilot instructions file
-          if git diff --name-only -z "$DIFF_BASE" | grep -z -qE "copilot-instructions\.md"; then
-            FOUND="$FOUND .github/copilot-instructions.md"
+          # Also flag any .github/ directory changes (workflows, agents, skills, copilot instructions, etc.)
+          GITHUB_FILES=$(git diff --name-only -z "$DIFF_BASE" | grep -z -E '^(.*/)?\.github/' | tr '\0' ' ')
+          if [ -n "$GITHUB_FILES" ]; then
+            FOUND="$FOUND .github/"
+            echo "📂 .github/ files changed: $GITHUB_FILES"
           fi
-          echo "found=$FOUND" >> $GITHUB_OUTPUT
+          echo "found=$FOUND" >> "$GITHUB_OUTPUT"
           if [ -n "$FOUND" ]; then
             echo "⚠️  IDE/Agent config directories changed:$FOUND"
           else
@@ -95,43 +128,54 @@ jobs:
                 MATCHES="${MATCHES}"$'\n'"${file}"
               fi
             fi
-          done < <(git diff --name-only -z "$DIFF_BASE" | grep -z -E '^(.*/)?(\.vscode|\.claude|\.idea|\.cursor|\.codeium|\.continue|\.windsurf)/.*\.json$')
+          done < <(git diff --name-only -z "$DIFF_BASE" | grep -z -E '^(.*/)?(${{ env.GREP_DIRS }})/.*\.json$')
 
           if [ -n "$MATCHES" ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
+            echo "found=true" >> "$GITHUB_OUTPUT"
             MATCHES_ENCODED=$(printf "%s" "$MATCHES" | base64 -w0)
-            echo "matches_encoded=$MATCHES_ENCODED" >> $GITHUB_OUTPUT
+            echo "matches_encoded=$MATCHES_ENCODED" >> "$GITHUB_OUTPUT"
             printf "🚨 runOn:folderOpen detected in:\n%s\n" "$MATCHES"
           else
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "matches_encoded=" >> $GITHUB_OUTPUT
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "matches_encoded=" >> "$GITHUB_OUTPUT"
             echo "✅ No runOn:folderOpen found."
           fi
 
       # ---------------------------------------------------------------
-      # 3. Scan for Claude / AI-agent SessionStart hooks
+      # 3. Scan for AI-agent hook types (SessionStart, PreToolUse,
+      #    PostToolUse, SessionBreak, or any "hooks" block)
       # ---------------------------------------------------------------
-      - name: Scan for AI agent SessionStart hooks
+      - name: Scan for AI agent hook types
         id: session_start
         run: |
           MATCHES=""
+          HOOK_PATTERNS=(
+            'SessionStart'
+            'PreToolUse'
+            'PostToolUse'
+            'SessionBreak'
+            '"hooks"'
+          )
           while IFS= read -r -d '' file; do
             if [ -f "$file" ]; then
-              if grep -Pn '"SessionStart"|SessionStart' "$file" 2>/dev/null; then
-                MATCHES="${MATCHES}"$'\n'"${file}"
-              fi
+              for pattern in "${HOOK_PATTERNS[@]}"; do
+                if grep -Pn "$pattern" "$file" 2>/dev/null; then
+                  MATCHES="${MATCHES}"$'\n'"${file} (${pattern})"
+                  break
+                fi
+              done
             fi
-          done < <(git diff --name-only -z "$DIFF_BASE" | grep -z -E '^(.*/)?(\.vscode|\.claude|\.idea|\.cursor|\.codeium|\.continue|\.windsurf)/.*\.json$')
+          done < <(git diff --name-only -z "$DIFF_BASE" | grep -z -E '^(.*/)?(${{ env.GREP_DIRS }})/.*\.json$')
 
           if [ -n "$MATCHES" ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
+            echo "found=true" >> "$GITHUB_OUTPUT"
             MATCHES_ENCODED=$(printf "%s" "$MATCHES" | base64 -w0)
-            echo "matches_encoded=$MATCHES_ENCODED" >> $GITHUB_OUTPUT
-            printf "🚨 SessionStart hook detected in:\n%s\n" "$MATCHES"
+            echo "matches_encoded=$MATCHES_ENCODED" >> "$GITHUB_OUTPUT"
+            printf "🚨 AI agent hook(s) detected in:\n%s\n" "$MATCHES"
           else
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "matches_encoded=" >> $GITHUB_OUTPUT
-            echo "✅ No SessionStart hooks found."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "matches_encoded=" >> "$GITHUB_OUTPUT"
+            echo "✅ No AI agent hooks found."
           fi
 
       # ---------------------------------------------------------------
@@ -147,16 +191,15 @@ jobs:
             'wget\s+'
             # -- fetch as a command/API call, not as a word (avoids false positives like "fetch-depth")
             '\bfetch[\s\(]'
-            # -- External URLs in config files (known false positive: extension marketplace URLs)
-            'https?://'
             # -- Command execution patterns
             '\bexec\b'
             '\bspawn\b'
             '\beval\b'
             # -- File permission changes
             '\bchmod\b'
-            # -- Obfuscation: base64 decode, hex encoding, command substitution
-            'base64\s*(-d|--decode)'
+            # -- Obfuscation: base64 decode (Linux -d/--decode, macOS -D), openssl base64, hex encoding, command substitution
+            'base64\s*(-d|--decode|-D)'
+            'openssl\s+base64'
             '\$\(.*\)'
             # -- Cross-platform shell execution
             'powershell'
@@ -171,7 +214,23 @@ jobs:
           # Use NUL-delimited git diff to handle filenames with spaces safely
           while IFS= read -r -d '' file; do
             case "$file" in
-              .vscode/*|*/.vscode/*|.claude/*|*/.claude/*|.idea/*|*/.idea/*|.cursor/*|*/.cursor/*|.codeium/*|*/.codeium/*|.continue/*|*/.continue/*|.windsurf/*|*/.windsurf/*)
+              ${{ env.CASE_GLOB }})
+                # Check for symlinks pointing outside the repository (path traversal)
+                if [ -L "$file" ]; then
+                  target="$(readlink -f "$file" 2>/dev/null || echo '')"
+                  repo_root="$(pwd)"
+                  if [ -n "$target" ]; then
+                    case "$target" in
+                      "$repo_root"/*) ;;  # within repo — allowed
+                      *)
+                        MATCHES="${MATCHES}"$'\n\n'"${file}] ⚠️ symlink target OUTSIDE repository → ${target}"
+                        ;;
+                    esac
+                  else
+                    # Dangling symlink — target doesn't exist
+                    MATCHES="${MATCHES}"$'\n\n'"${file}] ⚠️ dangling symlink"
+                  fi
+                fi
                 if [ -f "$file" ]; then
                   for pattern in "${PATTERNS[@]}"; do
                     result=$(grep -Pn "$pattern" "$file" 2>/dev/null | head -5)
@@ -185,14 +244,46 @@ jobs:
           done < <(git diff --name-only -z "$DIFF_BASE")
 
           if [ -n "$MATCHES" ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
+            echo "found=true" >> "$GITHUB_OUTPUT"
             MATCHES_ENCODED=$(printf "%s" "$MATCHES" | base64 -w0)
-            echo "matches_encoded=$MATCHES_ENCODED" >> $GITHUB_OUTPUT
+            echo "matches_encoded=$MATCHES_ENCODED" >> "$GITHUB_OUTPUT"
             printf "🚨 Suspicious exec/download patterns found:\n%s\n" "$MATCHES"
           else
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "matches_encoded=" >> $GITHUB_OUTPUT
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "matches_encoded=" >> "$GITHUB_OUTPUT"
             echo "✅ No suspicious exec/download patterns found."
+          fi
+
+      # ---------------------------------------------------------------
+      # 4b. Advisory URL scan (separate from critical exec patterns
+      #     to avoid false-positive firehose from legitimate URLs)
+      # ---------------------------------------------------------------
+      - name: Scan for external URLs in config files (advisory)
+        id: url_scan
+        run: |
+          MATCHES=""
+          while IFS= read -r -d '' file; do
+            case "$file" in
+              ${{ env.CASE_GLOB }})
+                if [ -f "$file" ]; then
+                  result=$(grep -Pn 'https?://' "$file" 2>/dev/null | head -10)
+                  if [ -n "$result" ]; then
+                    MATCHES="${MATCHES}"$'\n\n'"${file}]:${result}"
+                  fi
+                fi
+                ;;
+            esac
+          done < <(git diff --name-only -z "$DIFF_BASE")
+
+          if [ -n "$MATCHES" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            MATCHES_ENCODED=$(printf "%s" "$MATCHES" | base64 -w0)
+            echo "matches_encoded=$MATCHES_ENCODED" >> "$GITHUB_OUTPUT"
+            printf "ℹ️  External URLs found (advisory):\n%s\n" "$MATCHES"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "matches_encoded=" >> "$GITHUB_OUTPUT"
+            echo "✅ No external URLs found."
           fi
 
       # ---------------------------------------------------------------
@@ -205,10 +296,11 @@ jobs:
           KNOWN_BOT_PATTERNS=("dependabot" "renovate" "github-actions" "pre-commit-ci")
 
           # Get commits that touch IDE config dirs in this PR
-          COMMITS=$(git log $LOG_RANGE --format="%H %ae %an" -- \
-            '.vscode/' '.claude/' '.idea/' '.cursor/' '.codeium/' '.continue/' '.windsurf/' '.github/copilot-instructions.md' 2>/dev/null)
+          # Use tab separators so multi-word author names (e.g. "João Silva") are captured correctly
+          COMMITS=$(git log "$LOG_RANGE" --format="%H%x09%ae%x09%an" -- \
+            '.vscode/' '.claude/' '.idea/' '.cursor/' '.codeium/' '.continue/' '.windsurf/' '.github/' '.devcontainer/' 2>/dev/null)
 
-          while IFS=' ' read -r hash email name; do
+          while IFS=$'\t' read -r hash email name; do
             [ -z "$hash" ] && continue
             TRUSTED=false
             for bot in "${KNOWN_BOT_PATTERNS[@]}"; do
@@ -219,6 +311,10 @@ jobs:
             done
             # Flag emails that look spoofed (noreply-style, empty, or generic)
             if ! $TRUSTED; then
+              # Skip GitHub's own privacy noreply addresses — these are legitimate
+              if echo "$email" | grep -qiE '@users\.noreply\.github\.com$'; then
+                continue
+              fi
               if echo "$email" | grep -qiE '^$|noreply|no-reply|git@|unknown'; then
                 SUSPICIOUS="$SUSPICIOUS\n  ⚠️  Commit $hash by '$name' <$email> — verify identity"
               fi
@@ -226,10 +322,10 @@ jobs:
           done <<< "$COMMITS"
 
           if [ -n "$SUSPICIOUS" ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
+            echo "found=true" >> "$GITHUB_OUTPUT"
             printf "⚠️  Suspicious commit authors on IDE config changes:$SUSPICIOUS\n"
           else
-            echo "found=false" >> $GITHUB_OUTPUT
+            echo "found=false" >> "$GITHUB_OUTPUT"
             echo "✅ Commit authors look normal."
           fi
 
@@ -242,7 +338,7 @@ jobs:
           always() &&
           github.event_name == 'pull_request' &&
           github.event.pull_request.head.repo.fork != true
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             // Helper to decode base64 step outputs
@@ -255,14 +351,16 @@ jobs:
             const runOn        = '${{ steps.run_on.outputs.found }}';
             const sessionStart = '${{ steps.session_start.outputs.found }}';
             const execPat      = '${{ steps.exec_patterns.outputs.found }}';
+            const urlsFound    = '${{ steps.url_scan.outputs.found }}';
             const authorCheck  = '${{ steps.author_check.outputs.found }}';
 
             const runOnMatches       = decodeOutput('${{ steps.run_on.outputs.matches_encoded }}');
             const sessionStartMatches = decodeOutput('${{ steps.session_start.outputs.matches_encoded }}');
             const execPatMatches     = decodeOutput('${{ steps.exec_patterns.outputs.matches_encoded }}');
+            const urlsMatches        = decodeOutput('${{ steps.url_scan.outputs.matches_encoded }}');
 
             const critical = runOn === 'true' || sessionStart === 'true' || execPat === 'true';
-            const warning  = ideDirs.trim() !== '' || authorCheck === 'true';
+            const warning  = ideDirs.trim() !== '' || authorCheck === 'true' || urlsFound === 'true';
 
             if (!critical && !warning) {
               console.log('No IDE auto-exec security issues found. Skipping comment.');
@@ -286,25 +384,33 @@ jobs:
             }
 
             if (sessionStart === 'true') {
-              body += `### 🚨 AI agent \`SessionStart\` hook detected\n`;
-              body += `A config file (likely \`.claude/settings.json\`) contains a \`SessionStart\` hook. Claude Code and other AI agents execute these automatically at session startup.\n`;
+              body += `### 🚨 AI agent hook detected (\`SessionStart\`, \`PreToolUse\`, \`PostToolUse\`, etc.)\n`;
+              body += `A config file contains a \`hooks\` block or specific hook reference. Claude Code and other AI agents execute these automatically at session startup or before/after tool use.\n`;
               body += `This was used in recent supply chain attacks to re-execute malware whenever an AI coding session begins.\n\n`;
-              body += `**Required action:** Verify this hook is intentional and safe before merge.\n\n`;
+              body += `**Required action:** Verify every hook is intentional and safe before merge.\n\n`;
               body += `\`\`\`\n${sessionStartMatches}\n\`\`\`\n\n`;
             }
 
             if (execPat === 'true') {
-              body += `### 🚨 External download / exec patterns in IDE config files\n`;
-              body += `One or more changed IDE/agent config files contain patterns like \`curl\`, \`wget\`, \`eval\`, \`exec\`, external URLs, or obfuscated code.\n`;
-              body += `These patterns in IDE config files are high-risk and may execute automatically when the workspace is opened.\n\n`;
-              body += `**Required action:** Review all flagged files carefully. Legitimate IDE configs almost never fetch external URLs.\n\n`;
+              body += `### 🚨 External download / exec patterns in IDE config, .devcontainer/, or .github/ files\n`;
+              body += `One or more changed IDE/agent config, \`.devcontainer/\`, or \`.github/\` files contain patterns like \`curl\`, \`wget\`, \`eval\`, \`exec\`, or obfuscated code.\n`;
+              body += `These patterns in IDE/agent configs and devcontainer configs are high-risk and may execute automatically when the workspace is opened. Patterns in \`.github/\` files (workflows, agent instructions) may exfiltrate secrets or run arbitrary code.\n\n`;
+              body += `**Required action:** Review all flagged files carefully.\n\n`;
               body += `\`\`\`\n${execPatMatches}\n\`\`\`\n\n`;
             }
 
+            if (urlsFound === 'true') {
+              body += `### ℹ️ External URLs detected in config files\n`;
+              body += `One or more changed files contain \`https://\` or \`http://\` URLs.\n`;
+              body += `This is **advisory** — most IDE configs legitimately contain marketplace, schema, or documentation URLs.\n`;
+              body += `However, verify no URL points to an unexpected or untrusted host.\n\n`;
+              body += `\`\`\`\n${urlsMatches}\n\`\`\`\n\n`;
+            }
+
             if (ideDirs.trim() !== '') {
-              body += `### ⚠️ IDE / AI-agent config directories modified\n`;
-              body += `Changed directories: \`${ideDirs.trim()}\`\n\n`;
-              body += `These directories control how IDEs and AI agents behave in this workspace. Changes should be intentional and reviewed by at least one maintainer.\n\n`;
+              body += `### ⚠️ IDE / AI-agent config directories, .devcontainer/, or .github/ modified\n`;
+              body += `Changed: \`${ideDirs.trim()}\`\n\n`;
+              body += `These directories control how IDEs, AI agents, GitHub Actions, and dev containers behave in this workspace. Changes should be intentional and reviewed by at least one maintainer.\n\n`;
             }
 
             if (authorCheck === 'true') {
